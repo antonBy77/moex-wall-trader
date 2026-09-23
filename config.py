@@ -3,7 +3,7 @@ import os
 
 # Finam Trade API
 FINAM_TOKEN = os.environ["FINAM_TOKEN"]  # секрет только через окружение
-ACCOUNT_ID = "2060297"
+ACCOUNT_ID = os.environ.get("FINAM_ACCOUNT", "")  # не публикуем счёт
 
 # Instrument
 SYMBOL = "SBER@MISX"
