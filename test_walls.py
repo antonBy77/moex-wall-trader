@@ -26,7 +26,7 @@ class TestWallTracker(unittest.TestCase):
             {"price": p, "side": "bid"} for p in tr.walls["bid"]]))
 
     def test_eaten_gives_breakout(self):
-        tr = WallTracker(k=3.0, min_size=100, hold_min_updates=1)
+        tr = WallTracker(k=3.0, min_size=100, hold_min_updates=1, pull_stay_bps=1e9)
         bids = [(100.0, 5000), (99.9, 100)]
         asks = [(100.1, 100), (100.2, 90)]
         tr.update(snap(bids, asks), [])
@@ -38,7 +38,7 @@ class TestWallTracker(unittest.TestCase):
         self.assertEqual(eaten[0]["action"], "sell")  # bid-стену съели -> SELL
 
     def test_pulled_gives_pull_signal(self):
-        tr = WallTracker(k=3.0, min_size=100, hold_min_updates=1)
+        tr = WallTracker(k=3.0, min_size=100, hold_min_updates=1, pull_stay_bps=1e9)
         bids = [(100.0, 5000), (99.9, 100)]
         asks = [(100.1, 100), (100.2, 90)]
         tr.update(snap(bids, asks), [])

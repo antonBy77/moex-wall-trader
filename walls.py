@@ -23,11 +23,13 @@ from config import TICK
 
 class WallTracker:
     def __init__(self, k: float = 3.0, min_size: float = 3000,
-                 touch_bps: float = 3.0, hold_min_updates: int = 2):
+                 touch_bps: float = 3.0, hold_min_updates: int = 2,
+                 pull_stay_bps: float = 2.0):
         self.k = k                 # во сколько раз больше среднего
         self.min_size = min_size   # минимум лотов для статуса стены
         self.touch_bps = touch_bps # насколько близко цена считается "тестом" стены
         self.hold_min = hold_min_updates
+        self.pull_stay_bps = pull_stay_bps  # max отход mid от стены для валидного pull
         self.walls = {"bid": defaultdict(dict), "ask": defaultdict(dict)}
         self.last_mid = None
         self.last_report = None
@@ -39,7 +41,7 @@ class WallTracker:
         """Вызывается раз в цикл. Возвращает отчёт + сигнал."""
         bids, asks = snap["bids"], snap["asks"]  # [(price, size)] top-10
         mid = snap["mid"]
-        new_trades = tape[-5:]  # свежие принты
+        new_trades = tape[-50:]  # принты за окно (до 50)
 
         report = {"walls": [], "signals": []}
         if not bids or not asks:
@@ -80,6 +82,10 @@ class WallTracker:
                 if price in cur and eaten_ratio < 0.4:
                     continue  # стена жива и не съедена
                 store.pop(price)
+                # pull валиден только если цена осталась на месте (спуфинг),
+                # а не уехала от стены вместе со шкалой
+                if mid and abs(mid - price) / mid * 1e4 > self.pull_stay_bps:
+                    continue
                 if w["age"] >= self.hold_min:
                     ev = {"side": side, "price": price, "size0": w["size0"],
                           "age": w["age"], "eaten_ratio": round(eaten_ratio, 2)}
