@@ -42,6 +42,49 @@ class MarketState:
         self.big_prints = deque(maxlen=12)     # принты >= big_threshold
         self.big_threshold = 300
         self.lock = threading.Lock()
+        self.laya_verdicts = deque(maxlen=10)   # (ts, verdict, p_block)
+        self.laya_url = os.environ.get("LAYA_URL")
+        self._laya_thread = None
+
+    def _ask_laya(self, sig, side, price):
+        """Асинхронный вопрос гейту (если LAYA_URL задан). Вердикт ляжет в laya_verdicts."""
+        if not self.laya_url:
+            return
+        action = "buy" if "BUY" in sig[1] else "sell"
+        state = {
+            "symbol": self.symbol,
+            "signal": sig[1],
+            "wall_side": side, "wall_price": price,
+            "wall_size": sig[3].get("size", 0),
+            "wall_hits": sig[3].get("hits", 0),
+            "cvd": self.cvd,
+        }
+
+        def run():
+            try:
+                import urllib.request
+                body = json.dumps({
+                    "state": {"document": json.dumps(state)},
+                    "questions": {"trade": {
+                        "type": "rating",
+                        "instructions": f"Should we {action} at wall {price}?"}}}).encode()
+                req = urllib.request.Request(
+                    self.laya_url.rstrip("/") + "/v1/systemone", data=body,
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    res = json.loads(r.read())
+                # Jev-совместимый ответ: rating/trade -> value
+                v = res.get("trade", res)
+                val = float(v.get("value", 0.5))
+                verdict = "ALLOW" if val >= 0.5 else "BLOCK"
+                self.laya_verdicts.appendleft(
+                    (datetime.now(), f"{verdict} {action} {price:.2f}",
+                     val, "bold " + (UP if val >= 0.5 else DOWN)))
+            except Exception:
+                self.laya_verdicts.appendleft(
+                    (datetime.now(), f"Laya offline ({action} {price:.2f})", -1, DIM))
+
+        threading.Thread(target=run, daemon=True).start()
 
     # ---------- поток данных ----------
     def on_trade(self, t):
@@ -72,17 +115,19 @@ class MarketState:
                        ((side == "bid" and d == -1) or (side == "ask" and d == 1)):
                         w["hits"] += 1
                         if w["hits"] == 1:
-                            self.signals.appendleft(
-                                (ts, f"REJECTION {'BUY' if side=='bid' else 'SELL'} @ {pp:.2f}",
-                                 WALL, w))
+                            sig = (ts, f"REJECTION {'BUY' if side=='bid' else 'SELL'} @ {pp:.2f}",
+                                   WALL, w)
+                            self.signals.appendleft(sig)
+                            self._ask_laya(sig, side, pp)
                     if (side == "bid" and d == -1 and p <= pp) or \
                        (side == "ask" and d == 1 and p >= pp):
                         w["size"] = max(0, w["size"] - s)
                         w["min_seen"] = min(w["min_seen"], w["size"])
                         if w["size"] < w["size0"] * 0.3 and w["hits"] >= 3:
-                            self.signals.appendleft(
-                                (ts, f"BREAKOUT {'SELL' if side=='bid' else 'BUY'} @ {pp:.2f}",
-                                 DOWN, w))
+                            sig = (ts, f"BREAKOUT {'SELL' if side=='bid' else 'BUY'} @ {pp:.2f}",
+                                   DOWN, w)
+                            self.signals.appendleft(sig)
+                            self._ask_laya(sig, side, pp)
                             del self.walls[side][pp]
                         elif w["size"] <= 0:
                             del self.walls[side][pp]
@@ -233,15 +278,15 @@ def render_candles(st, width=46, rows_n=13):
     return t
 
 
-def render_clusters(st, rows_n=15, width=50):
-    """Кластеры объёма: горизонтальные бары по ценовым уровням из ленты.
-    Последний час, tick-группировка. POC жёлтым, buy/sell расщепление."""
+def render_clusters(st, rows_n=15, width=50, window_hours=None):
+    """Кластеры объёма: бары по ценовым уровням из ленты. window_hours=None = весь день."""
     if len(st.tape) < 10:
         return Text("ожидание данных…", style=DIM)
     tape = list(st.tape)
-    t_last = tape[-1][0]
-    hour_ago = t_last.timestamp() - 3600
-    tape = [r for r in tape if r[0].timestamp() >= hour_ago] or tape[-500:]
+    if window_hours:
+        t_last = tape[-1][0]
+        cut = t_last.timestamp() - window_hours * 3600
+        tape = [r for r in tape if r[0].timestamp() >= cut] or tape[-500:]
     # группировка по тикам
     clusters = {}   # price -> [buy, sell]
     for _, p, s, d in tape:
@@ -295,11 +340,12 @@ def render_cvd(st, width=46, rows_n=5):
 def build_ui(st, W=150, H=42):
     layout = Layout()
     layout.split_column(Layout(name="top", size=3), Layout(name="body"))
-    layout["body"].split_row(Layout(name="left", ratio=1), Layout(name="right", ratio=2))
-    layout["left"].split_column(Layout(name="book"), Layout(name="big", size=10))
-    layout["right"].split_column(Layout(name="cand"), Layout(name="mid", size=17),
+    layout["body"].split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=3))
+    layout["left"].split_column(Layout(name="book", ratio=3), Layout(name="big", size=9),
+                                Layout(name="laya", size=9))
+    layout["right"].split_column(Layout(name="cand"), Layout(name="mid", ratio=1),
                                  Layout(name="bottom", ratio=1))
-    layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=34))
+    layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=30))
 
     with st.lock:
         last = st.tape[-1] if st.tape else None
@@ -325,8 +371,8 @@ def build_ui(st, W=150, H=42):
         layout["cand"].update(Panel(render_candles(st),
                                     title=f"[dim]свечи {st.candle_sec}с · стены/айсберги[/dim]",
                                     border_style="#2a3542"))
-        layout["mid"].update(Panel(render_clusters(st),
-                                   title="[dim]кластеры объёма (час) · █buy ▓sell · ◄POC[/dim]",
+        layout["mid"].update(Panel(render_clusters(st, window_hours=None),
+                                   title="[dim]кластеры объёма (день) · █buy ▓sell · ◄POC[/dim]",
                                    border_style="#2a3542"))
         layout["tape"].update(Panel(render_tape(st), title="[dim]лента[/dim]",
                                     border_style="#2a3542"))
@@ -342,6 +388,20 @@ def build_ui(st, W=150, H=42):
         layout["big"].update(Panel(bt or Text("—", style=DIM),
                                    title=f"[dim]крупные ≥{st.big_threshold:.0f}[/dim]",
                                    border_style="#2a3542"))
+
+        # Laya-вердикты
+        lt = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
+        lt.add_column(width=8); lt.add_column(width=22)
+        for ts, msg, val, col in list(st.laya_verdicts)[:4]:
+            vt = f"{val:.2f}" if val >= 0 else "—"
+            lt.add_row(Text(ts.strftime("%H:%M:%S"), style=DIM),
+                       Text.assemble((f"{msg}", col), (f" {vt}", DIM)))
+        if not st.laya_verdicts:
+            lt.add_row(Text("—", style=DIM),
+                       Text("LAYA_URL не задан" if not st.laya_url else "ждём сигналы…",
+                            style=DIM))
+        layout["laya"].update(Panel(lt, title="[dim]Laya-гейт · /v1/systemone[/dim]",
+                                    border_style="#2a3542"))
 
         # статистика: cvd-спарклайн, дисбаланс по 10с-корзинам, сигналы счётом
         n = len(st.tape)
