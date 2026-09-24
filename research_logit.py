@@ -72,6 +72,7 @@ def main():
     cvd_hist = deque()
     imb_hist = deque(maxlen=80)
     vol_1m = deque(maxlen=2000)
+    last_spr = 1.0
     day_hi = day_lo = None
     ob_i = 0
 
@@ -95,12 +96,18 @@ def main():
                     continue
                 for k, (p, s) in enumerate(tops):
                     others = [x[1] for j, x in enumerate(tops) if j != k]
-                    if s >= max(2.0 * sum(others) / len(others), 1500):
+                    avg = sum(others) / len(others)
+                    if s >= max(2.0 * avg, 1500):
                         walls.setdefault((side, p),
-                                         {"size0": s, "size": s, "hits": 0, "first": None})
+                                         {"size0": s, "size": s, "hits": 0,
+                                          "first": None, "ratio": s / avg})
             b3 = sum(s for _, s in b[:3]); a3 = sum(s for _, s in a[:3])
             if b3 + a3:
                 imb_hist.append((b3 - a3) / (b3 + a3))
+            if len(b) > 1 and len(a) > 1:
+                spr = (a[0][0] - b[0][0]) / TICK
+                if spr > 0:
+                    last_spr = spr
             ob_i += 1
 
         # съедание стен + сигналы rejection (1-е касание)
@@ -115,18 +122,21 @@ def main():
                         w["first"] = dt
                         dirn = 1 if s_side == "bid" else -1
                         cvd5 = (cvd - cvd_hist[0][1]) if cvd_hist else 0
+                        # wall_ratio = размер стены к среднему соседнему объёму
+                        # (берём из стакана при регистрации; восстанавливаем из wall_size,
+                        #  а точнее — храним avg соседей при создании стены)
+                        ratio = w.get("ratio", 2.0)
                         mfe, mae = max_favorable_adverse(tape, i, dirn)
                         trades.append({
                             "dt": dt, "side": s_side, "price": pp,
                             "cvd_5m": cvd5,
                             "trend_5m": (price - tape[max(0, i-300)][1]),
                             "imb3": imb_hist[-1] if imb_hist else 0.0,
-                            "wall_ratio": w["size0"] /
-                                          max(1.0, w["size0"] / max(2.0, w["hits"] + 2)),
+                            "wall_ratio": ratio,
                             "wall_size": w["size0"],
                             "dist_day_hi": (day_hi - price) / TICK,
                             "dist_day_lo": (price - day_lo) / TICK,
-                            "spread": 1.0,
+                            "spread": last_spr,
                             "vol_1m": sum(s2 for _, s2 in vol_1m),
                             "hour_frac": dt.hour + dt.minute / 60.0,
                             "mfe": mfe, "mae": mae,
