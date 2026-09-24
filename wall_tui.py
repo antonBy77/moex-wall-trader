@@ -43,9 +43,34 @@ class MarketState:
         self.big_prints = deque(maxlen=12)     # принты >= big_threshold
         self.big_threshold = 300
         self.lock = threading.Lock()
-        self.laya_verdicts = deque(maxlen=10)   # (ts, verdict, p_block)
+        self.laya_verdicts = deque(maxlen=10)   # (ts, verdict, val, style)
         self.laya_url = os.environ.get("LAYA_URL")
+        self.laya_stats = {"allow_pnl": 0.0, "allow_n": 0, "allow_win": 0,
+                           "block_pnl": 0.0, "block_n": 0, "block_win": 0}
+        self.laya_pending = []   # [(open_ts, action, price)] — ждут исхода 5п тейк/стоп
+        self.laya_trade = 0.05   # тейк/стоп 5 тиков, как в бэктесте
         self._laya_thread = None
+
+    def _settle_laya(self, ts_now, price):
+        """Проверяет открытые Laya-входы: тейк +5 тиков / стоп -5 тиков."""
+        for item in list(self.laya_pending):
+            ts0, action, entry, allowed = item
+            dt = (ts_now - ts0).total_seconds()
+            dirn = 1 if action == "buy" else -1
+            hit_tp = (price >= entry + self.laya_trade) if dirn > 0 else (price <= entry - self.laya_trade)
+            hit_sl = (price <= entry - self.laya_trade) if dirn > 0 else (price >= entry + self.laya_trade)
+            timeout = dt > 600
+            if not (hit_tp or hit_sl or timeout):
+                continue
+            pnl = ((price - entry) * dirn) if timeout else \
+                  (self.laya_trade if hit_tp else -self.laya_trade)
+            result = "tp" if hit_tp else ("sl" if hit_sl else "time")
+            key = "allow" if allowed else "block"
+            self.laya_stats[key + "_pnl"] += pnl
+            self.laya_stats[key + "_n"] += 1
+            if pnl > 0:
+                self.laya_stats[key + "_win"] += 1
+            self.laya_pending.remove(item)
 
     def _ask_laya(self, sig, side, price):
         """Асинхронный вопрос гейту (если LAYA_URL задан). Вердикт ляжет в laya_verdicts."""
@@ -78,9 +103,11 @@ class MarketState:
                 v = res.get("trade", res)
                 val = float(v.get("value", 0.5))
                 verdict = "ALLOW" if val >= 0.5 else "BLOCK"
+                allowed = val >= 0.5
                 self.laya_verdicts.appendleft(
                     (datetime.now(), f"{verdict} {action} {price:.2f}",
-                     val, "bold " + (UP if val >= 0.5 else DOWN)))
+                     val, "bold " + (UP if allowed else DOWN)))
+                self.laya_pending.append((datetime.now(), action, price, allowed))
             except Exception:
                 self.laya_verdicts.appendleft(
                     (datetime.now(), f"Laya offline ({action} {price:.2f})", -1, DIM))
@@ -96,6 +123,8 @@ class MarketState:
             d = 1 if t["side"] == "buy" else -1
             self.tape.append((ts, p, s, d))
             self.tape_view.append((ts, p, s, d))
+            if self.laya_url and self.laya_pending:
+                self._settle_laya(ts, p)
             self.cvd += s * d
             self.cvd_hist.append((ts, self.cvd))
             if s >= self.big_threshold:
@@ -391,10 +420,10 @@ def build_ui(st, W=150, H=42):
                                    title=f"[dim]крупные ≥{st.big_threshold:.0f}[/dim]",
                                    border_style="#2a3542"))
 
-        # Laya-вердикты
+        # Laya-вердикты + P/L A/B
         lt = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
         lt.add_column(width=8); lt.add_column(width=22)
-        for ts, msg, val, col in list(st.laya_verdicts)[:4]:
+        for ts, msg, val, col in list(st.laya_verdicts)[:3]:
             vt = f"{val:.2f}" if val >= 0 else "—"
             lt.add_row(Text(ts.strftime("%H:%M:%S"), style=DIM),
                        Text.assemble((f"{msg}", col), (f" {vt}", DIM)))
@@ -402,7 +431,22 @@ def build_ui(st, W=150, H=42):
             lt.add_row(Text("—", style=DIM),
                        Text("LAYA_URL не задан" if not st.laya_url else "ждём сигналы…",
                             style=DIM))
-        layout["laya"].update(Panel(lt, title="[dim]Laya-гейт · /v1/systemone[/dim]",
+        s = st.laya_stats
+        if s["allow_n"] or s["block_n"]:
+            a_pnl, b_pnl = s["allow_pnl"], s["block_pnl"]
+            lt.add_row(Text("P/L:", style="bold"))
+            lt.add_row(Text.assemble(
+                ("ALLOW ", UP), (f"{a_pnl:+.2f}₽ ", "bold " + (UP if a_pnl >= 0 else DOWN)),
+                (f"({s['allow_n']} / win {s['allow_win']}/{s['allow_n']})" if s['allow_n'] else "(0)", DIM)))
+            lt.add_row(Text.assemble(
+                ("BLOCK ", DOWN), (f"{b_pnl:+.2f}₽ ", "bold " + (UP if b_pnl >= 0 else DOWN)),
+                (f"({s['block_n']} / win {s['block_win']}/{s['block_n']})" if s['block_n'] else "(0)", DIM)))
+            edge = a_pnl - b_pnl
+            lt.add_row(Text.assemble(
+                ("гейт ", DIM),
+                (f"{'+' if edge >= 0 else ''}{edge:.2f}₽", "bold " + (UP if edge >= 0 else DOWN)),
+                (" (allow-block)", DIM)))
+        layout["laya"].update(Panel(lt, title="[dim]Laya-гейт · P/L allow vs block[/dim]",
                                     border_style="#2a3542"))
 
         # статистика: cvd-спарклайн, дисбаланс по 10с-корзинам, сигналы счётом
