@@ -26,6 +26,11 @@ walls_v2.py          SmartWallTracker: стены + айсберги + hit-сч�
                      Каждый сигнал несёт фичи: cvd, flow_imbalance, trend 5м,
                      day-range position, spread, wall_ratio/hits/age/eaten/iceberg.
 walls.py             WallTracker v1 (базовый, без айсбергов).
+wall_tui.py          Терминальный дашборд (rich): стакан с барами и стенами/айсбергами,
+                     лента с агрессором и крупными принтами ⚡, свечи, кластеры
+                     объёма за день (█buy ▓sell, POC), панель Laya-гейта с
+                     вердиктами и живым P/L A/B (allow vs block, тейк/стоп ±5 тиков).
+                     Режимы: live (gRPC-стримы) и --replay NDJSON с ускорением.
 laya_gate.py         AI-гейт: HTTP на laya-serve (Jev-совместимый /v1/systemone).
                      Fallback на стеновой сигнал при падении сервера.
 trader.py / laya_wall_trader.py   Live-циклы (DRY_RUN).
@@ -45,7 +50,7 @@ test_walls.py        Юнит-тесты (8/8 OK).
 ## Запуск
 
 ```bash
-export FINAM_TOKEN="твой токен Finam Trade API"
+export FINAM_TOKEN="твой токен Finam Trade API"   # или set -a && source .env && set +a
 
 # полный сбор дня (стриминг): лента без пропусков + стакан 2с
 python3 collector_stream.py --symbols SBER@MISX --hours 10
@@ -53,9 +58,23 @@ python3 collector_stream.py --symbols SBER@MISX --hours 10
 # бэктест A/B (без гейта / с гейтом-репликой)
 python3 backtest_gate.py --strategy rejection    # или breakout
 
+# терминальный дашборд LIVE: стакан, лента, свечи, кластеры, Laya P/L
+FINAM_TOKEN=... LAYA_URL=http://127.0.0.1:8015 \
+  python3 wall_tui.py --symbol SBER@MISX
+
+# дашборд на исторических данных (токен не нужен, день за ~2.5 мин на x30)
+LAYA_URL=http://127.0.0.1:8015 \
+  python3 wall_tui.py --replay data/SBER-MISX-2026-09-24.ndjson --speed 30 --candle-sec 60
+
 # тесты
 FINAM_TOKEN=x python3 test_walls.py
 ```
+
+Панель Laya-гейта в TUI: каждый сигнал (REJECTION/BREAKOUT) уходит в laya-serve
+(`/v1/systemone`, type=choice, критерии allow/block/escalate). Вердикт с
+P(allow) показывается сразу; сделка (виртуальная, тейк/стоп ±5 тиков, таймаут
+10 мин) закрывается по ленте и попадает в счёт **ALLOW vs BLOCK** — строка
+«гейт +X.XX₽ (allow-block)» = сколько гейт спас/потерял, блокируя входы.
 
 ## Результаты (SBER@MISX, 24.09.2026, полный день, DRY_RUN)
 
