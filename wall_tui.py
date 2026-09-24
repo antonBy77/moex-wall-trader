@@ -233,6 +233,50 @@ def render_candles(st, width=46, rows_n=13):
     return t
 
 
+def render_clusters(st, rows_n=15, width=50):
+    """Кластеры объёма: горизонтальные бары по ценовым уровням из ленты.
+    Последний час, tick-группировка. POC жёлтым, buy/sell расщепление."""
+    if len(st.tape) < 10:
+        return Text("ожидание данных…", style=DIM)
+    tape = list(st.tape)
+    t_last = tape[-1][0]
+    hour_ago = t_last.timestamp() - 3600
+    tape = [r for r in tape if r[0].timestamp() >= hour_ago] or tape[-500:]
+    # группировка по тикам
+    clusters = {}   # price -> [buy, sell]
+    for _, p, s, d in tape:
+        key = round(p / st.tick) * st.tick
+        c = clusters.setdefault(key, [0.0, 0.0])
+        c[0 if d > 0 else 1] += s
+    if not clusters:
+        return Text("…", style=DIM)
+    mx = max(b + sl for b, sl in clusters.values())
+    poc = max(clusters, key=lambda k: sum(clusters[k]))
+    lo, hi = min(clusters), max(clusters)
+    # один ряд на тик (если уровней много — шагаем)
+    step = max(1, int((hi - lo) / st.tick / rows_n) + 1)
+    prices = sorted(clusters, reverse=True)
+    shown = prices[::step][:rows_n]
+    mx_w = width - 14
+    t = Text()
+    for p in shown:
+        b, sl = clusters[p]
+        tot = b + sl
+        nb = int(b / mx * mx_w)
+        ns = int(sl / mx * mx_w)
+        is_poc = p == poc
+        col_b = WALL if is_poc else UP
+        col_s = WALL if is_poc else DOWN
+        pct = tot / mx
+        t.append(Text(f"{p:8.2f} ", style=WALL if is_poc else DIM))
+        t.append(Text("█" * nb, style=col_b))
+        t.append(Text("▓" * ns, style=col_s))
+        if is_poc:
+            t.append(Text(" ◄POC", style=WALL))
+        t.append(Text(f" {tot:>7.0f}\n", style=DIM))
+    return t
+
+
 def render_cvd(st, width=46, rows_n=5):
     if len(st.cvd_hist) < 3:
         return Text("…", style=DIM)
@@ -253,7 +297,8 @@ def build_ui(st, W=150, H=42):
     layout.split_column(Layout(name="top", size=3), Layout(name="body"))
     layout["body"].split_row(Layout(name="left", ratio=1), Layout(name="right", ratio=2))
     layout["left"].split_column(Layout(name="book"), Layout(name="big", size=10))
-    layout["right"].split_column(Layout(name="cand"), Layout(name="bottom", ratio=1))
+    layout["right"].split_column(Layout(name="cand"), Layout(name="mid", size=17),
+                                 Layout(name="bottom", ratio=1))
     layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=34))
 
     with st.lock:
@@ -280,6 +325,9 @@ def build_ui(st, W=150, H=42):
         layout["cand"].update(Panel(render_candles(st),
                                     title=f"[dim]свечи {st.candle_sec}с · стены/айсберги[/dim]",
                                     border_style="#2a3542"))
+        layout["mid"].update(Panel(render_clusters(st),
+                                   title="[dim]кластеры объёма (час) · █buy ▓sell · ◄POC[/dim]",
+                                   border_style="#2a3542"))
         layout["tape"].update(Panel(render_tape(st), title="[dim]лента[/dim]",
                                     border_style="#2a3542"))
 
