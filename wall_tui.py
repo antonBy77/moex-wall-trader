@@ -78,9 +78,17 @@ class MarketState:
                                   self.laya_stats["block_pnl"]))
 
     def _ask_laya(self, sig, side, price):
-        """Асинхронный вопрос гейту (если LAYA_URL задан). Вердикт ляжет в laya_verdicts."""
+        """Асинхронный вопрос гейту (если LAYA_URL задан). Вердикт ляжет в laya_verdicts.
+        Дедуп: не шлём повторно по той же стене, пока прошлый запрос в полёте."""
         if not self.laya_url:
             return
+        key = (side, round(price, 2))
+        now = time.time()
+        if getattr(self, "_laya_inflight", None) is None:
+            self._laya_inflight = {}
+        if now - self._laya_inflight.get(key, 0) < 30:
+            return  # уже спрашивали недавно
+        self._laya_inflight[key] = now
         action = "buy" if "BUY" in sig[1] else "sell"
         state = {
             "symbol": self.symbol,
@@ -110,7 +118,7 @@ class MarketState:
                 req = urllib.request.Request(
                     self.laya_url.rstrip("/") + "/v1/systemone", data=body,
                     headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=8) as r:
+                with urllib.request.urlopen(req, timeout=20) as r:
                     res = json.loads(r.read())
                 # Jev-совместимый ответ: answers.verdict = {choice, probabilities}
                 v = res.get("answers", {}).get("verdict", res.get("verdict", res))
