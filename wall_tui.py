@@ -31,7 +31,8 @@ class MarketState:
         self.symbol = symbol
         self.candle_sec = candle_sec
         self.tick = 0.01
-        self.tape = deque(maxlen=400)          # (ts, p, s, d)
+        self.tape = deque(maxlen=60000)        # (ts, p, s, d) — день SBER ~50-80К
+        self.tape_view = deque(maxlen=120)     # короткий хвост для панели «лента»
         self.book = {"bids": [], "asks": []}
         self.candles = deque(maxlen=70)        # (bucket, o,h,l,c,vol, buyvol)
         self._cur = None
@@ -94,6 +95,7 @@ class MarketState:
             p, s = t["price"], t["size"]
             d = 1 if t["side"] == "buy" else -1
             self.tape.append((ts, p, s, d))
+            self.tape_view.append((ts, p, s, d))
             self.cvd += s * d
             self.cvd_hist.append((ts, self.cvd))
             if s >= self.big_threshold:
@@ -218,7 +220,7 @@ def render_tape(st, height=16):
     tb.add_column("цена", justify="right", width=7)
     tb.add_column("объём", justify="right", width=7)
     tb.add_column("поток", width=20)
-    rows = list(st.tape)[-height:][::-1]
+    rows = list(st.tape_view)[-height:][::-1]
     mx = max((s for _, _, s, _ in rows), default=1)
     for ts, p, s, d in rows:
         col = UP if d > 0 else DOWN
@@ -404,8 +406,8 @@ def build_ui(st, W=150, H=42):
                                     border_style="#2a3542"))
 
         # статистика: cvd-спарклайн, дисбаланс по 10с-корзинам, сигналы счётом
-        n = len(st.tape)
-        buys = sum(1 for *_, d in st.tape if d > 0)
+        n = len(st.tape_view)
+        buys = sum(1 for *_, d in st.tape_view if d > 0)
         stat = Text.assemble(
             (f"сделок {n}\n", TXT), (f"▲{buys} ▼{n - buys}\n", DIM),
             (f"стен bid {len(st.walls['bid'])} / ask {len(st.walls['ask'])}\n", WALL),
