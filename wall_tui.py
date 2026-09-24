@@ -83,28 +83,36 @@ class MarketState:
     def on_book(self, ob):
         with self.lock:
             self.book = {"bids": ob["bids"], "asks": ob["asks"]}
-            # детект стен: уровень >= 3x среднего топ-10 соседей и >= 3000 лотов
+            # детект стен: уровень >= WALL_Kx среднего топ-10 соседей (без самого
+            # уровня!) и >= WALL_MIN лотов. Пороги мягче walls.py: TUI — взгляд
+            # в реальном времени, лучше показать кандидата раньше.
+            WALL_K, WALL_MIN = float(os.environ.get("TUI_WALL_K", 2.0)), \
+                float(os.environ.get("TUI_WALL_MIN", 1500))
             for side, levels in (("bid", ob["bids"]), ("ask", ob["asks"])):
                 tops = levels[:10]
-                if len(tops) < 5:
+                if len(tops) < 3:
                     continue
                 for p, s in tops:
                     others = [x[1] for x in tops if x[0] != p][:6]
                     avg = sum(others) / len(others) if others else 0
-                    if avg and s >= max(3 * avg, 3000):
+                    if avg and s >= max(WALL_K * avg, WALL_MIN):
                         w = self.walls[side].get(p)
                         if w:
-                            if s >= w["size0"] * 0.9 and w["hits"] >= 1:
+                            # айсберг: ели >=30%, а объём вернулся к >=90% исходного
+                            if w["hits"] >= 1 and s >= w["size0"] * 0.9 \
+                                    and w.get("min_seen", s) < w["size0"] * 0.7:
                                 w["iceberg"] = True
                             w["size"] = s
+                            w["min_seen"] = min(w.get("min_seen", s), s)
                             w["last"] = time.time()
                         else:
-                            self.walls[side][p] = {"size": s, "size0": s, "hits": 0,
+                            self.walls[side][p] = {"size": s, "size0": s,
+                                                   "min_seen": s, "hits": 0,
                                                    "iceberg": False, "last": time.time()}
-                # чистка исчезнувших
+                # чистка исчезнувших (терпим 30с — стена может мигать на апдейтах)
                 prices = {p for p, _ in levels[:12]}
                 for p in list(self.walls[side]):
-                    if p not in prices and time.time() - self.walls[side][p].get("last", 0) > 20:
+                    if p not in prices and time.time() - self.walls[side][p].get("last", 0) > 30:
                         del self.walls[side][p]
 
 
@@ -163,7 +171,7 @@ def render_tape(st, height=12):
 
 
 def render_candles(st, width=44):
-    """ASCII-свечи (масштаб по мин/макс окна)."""
+    """ASCII-свечи с цветом (зелёные/красные тела, стены жёлтым, айсберги фиолетовым)."""
     cs = list(st.candles)
     if st._cur:
         cs.append(st._cur)
@@ -174,37 +182,55 @@ def render_candles(st, width=44):
     rows_n = 11
     rng = (hi - lo) or 1
     grid = [[" "] * len(cs) for _ in range(rows_n)]
+    colors = [[None] * len(cs) for _ in range(rows_n)]
     for x, c in enumerate(cs):
         o, h, l, cl = c[1], c[2], c[3], c[4]
-        y = lambda p: int((hi - p) / rng * (rows_n - 1))
         col = UP if cl >= o else DOWN
-        for yy in range(y(h), y(l) + 1):
-            grid[yy][x] = "│"
+        y = lambda p: min(rows_n - 1, int((hi - p) / rng * (rows_n - 1)))
+        for yy in range(y(h), y(l) + 1):          # тень
+            grid[yy][x] = "│"; colors[yy][x] = DIM
         top, bot = (y(max(o, cl)), y(min(o, cl)))
-        for yy in range(top, bot + 1):
-            grid[yy][x] = "█"
-    # стены поверх
+        body_h = bot - top
+        for yy in range(top, bot + 1):            # тело
+            grid[yy][x] = "█" if body_h >= 1 else "▄"
+            colors[yy][x] = col
+    # стены поверх (жёлтые ───, айсберги фиолетовые ⛁)
     for side in ("bid", "ask"):
         for p, w in st.walls[side].items():
             if lo <= p <= hi:
                 yy = int((hi - p) / rng * (rows_n - 1))
+                mark = "⛁" if w["iceberg"] else "─"
+                ccol = ICE if w["iceberg"] else WALL_B
                 for x in range(len(cs)):
-                    if grid[yy][x] == " ":
-                        grid[yy][x] = "─"
-    lines = ["".join(r) for r in grid]
+                    if colors[yy][x] in (None, DIM):
+                        grid[yy][x] = mark
+                        colors[yy][x] = ccol
     t = Text()
-    for i, ln in enumerate(lines):
-        t.append(ln + "\n", style=DIM)
-    # стены с ценами
+    for row_c, row_col in zip(grid, colors):
+        prev, run = None, 0
+        for x, (ch, cc) in enumerate(zip(row_c, row_col)):
+            key = cc or DIM
+            if key != prev and run:
+                pass
+            if prev is not None and key != prev:
+                pass
+            if key != prev:
+                prev = key
+            t.append(ch, style=key)
+        t.append("\n")
+    # легенда стен
     wall_labels = []
     for side in ("bid", "ask"):
-        for p, w in st.walls[side].items():
+        for p, w in sorted(st.walls[side].items()):
             if lo <= p <= hi:
-                ice = " ⛁айсберг" if w["iceberg"] else ""
-                wall_labels.append(f"{'▲' if side=='bid' else '▼'} {p:.2f} "
-                                   f"{w['size']:.0f} х{w['hits']}{ice}")
-    if wall_labels:
-        t.append("\n".join(wall_labels[:4]), style=WALL_B)
+                ice = " ⛁АЙСБЕРГ" if w["iceberg"] else ""
+                arrow = "▲bid" if side == "bid" else "▼ask"
+                wall_labels.append((f"{arrow} {p:.2f}  {w['size']:.0f} лотов  "
+                                    f"х{w['hits']}{ice}",
+                                    ICE if w["iceberg"] else WALL_B))
+    for lbl, col in wall_labels[:4]:
+        t.append("\n")
+        t.append(lbl, style=col)
     return t
 
 
