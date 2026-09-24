@@ -41,7 +41,9 @@ class MarketState:
         self.cvd = 0.0
         self.cvd_hist = deque(maxlen=60)
         self.big_prints = deque(maxlen=12)     # принты >= big_threshold
-        self.big_threshold = 300
+        self.big_threshold = float(os.environ.get("TUI_BIG_MIN", 300))
+        self.pnl_hist = deque(maxlen=120)      # (ts, allow_pnl, block_pnl) — график P/L
+        self.last_signals = deque(maxlen=8)    # последние сигналы стен для статистики
         self.lock = threading.Lock()
         self.laya_verdicts = deque(maxlen=10)   # (ts, verdict, val, style)
         self.laya_url = os.environ.get("LAYA_URL")
@@ -71,6 +73,9 @@ class MarketState:
             if pnl > 0:
                 self.laya_stats[key + "_win"] += 1
             self.laya_pending.remove(item)
+            # снапшот кривой P/L для графика в правой панели
+            self.pnl_hist.append((ts_now, self.laya_stats["allow_pnl"],
+                                  self.laya_stats["block_pnl"]))
 
     def _ask_laya(self, sig, side, price):
         """Асинхронный вопрос гейту (если LAYA_URL задан). Вердикт ляжет в laya_verdicts."""
@@ -115,7 +120,7 @@ class MarketState:
                 else:
                     raw, probs = str(v).lower(), {}
                 if "allow" in raw:
-                    verdict, allowed, col = "ALLOW", True, "bold " + UP
+                    verdict, allowed, col = "ALLOW LONG" if action == "buy" else "ALLOW SHORT", True, "bold " + UP
                 elif "escalate" in raw:
                     verdict, allowed, col = "ESCALATE", True, "bold #ffd166"
                 else:
@@ -288,14 +293,19 @@ def render_book(st, height=14):
     return tb
 
 
-def render_tape(st, height=16):
+def render_tape(st, height=16, big_only=False):
     tb = Table(box=box.SIMPLE, show_header=True, header_style="bold dim",
                padding=(0, 0), expand=True)
     tb.add_column("время", style=DIM, width=8)
     tb.add_column("цена", justify="right", width=7)
     tb.add_column("объём", justify="right", width=7)
     tb.add_column("поток", width=20)
-    rows = list(st.tape_view)[-height:][::-1]
+    tail = list(st.tape_view)[-height * 4:]
+    if big_only:
+        tail = [r for r in tail if r[2] >= st.big_threshold]
+    rows = tail[-height:][::-1]
+    if not rows:
+        return Text("нет принтов ≥ фильтра", style=DIM)
     mx = max((s for _, _, s, _ in rows), default=1)
     for ts, p, s, d in rows:
         col = UP if d > 0 else DOWN
@@ -318,8 +328,8 @@ def render_candles(st, width=46, rows_n=13):
     cs = cs[-width:]
     hi = max(c[2] for c in cs); lo = min(c[3] for c in cs)
     rng = (hi - lo) or 1
-    grid = [[" "] * len(cs) for _ in range(rows_n)]
-    colors = [[None] * len(cs) for _ in range(rows_n)]
+    grid: list = [[" "] * len(cs) for _ in range(rows_n)]
+    colors: list = [[None] * len(cs) for _ in range(rows_n)]
     y = lambda p: min(rows_n - 1, int((hi - p) / rng * (rows_n - 1)))
     for x, c in enumerate(cs):
         o, h, l, cl = c[1], c[2], c[3], c[4]
@@ -339,6 +349,17 @@ def render_candles(st, width=46, rows_n=13):
                 for x in range(len(cs)):
                     if colors[yy][x] in (None, "#31404e"):
                         grid[yy][x] = mk; colors[yy][x] = cc
+    # метка последней цены справа
+    last_p = cs[-1][4]
+    if lo <= last_p <= hi:
+        yy = y(last_p)
+        grid[yy][len(cs) - 1] = "◄"
+        colors[yy][len(cs) - 1] = "bold white"
+        t_lbl = f"{last_p:.2f}"
+        for x in range(max(0, len(cs) - 7), len(cs) - 1):
+            if grid[yy][x] in (" ",):
+                grid[yy][x] = t_lbl[x - (len(cs) - 7)] if x - (len(cs) - 7) < len(t_lbl) else " "
+                colors[yy][x] = "bold white"
     t = Text()
     for row_c, row_cl in zip(grid, colors):
         for ch, cc in zip(row_c, row_cl):
@@ -414,15 +435,87 @@ def render_cvd(st, width=46, rows_n=5):
     return t
 
 
-def build_ui(st, W=150, H=42):
+def render_pnl_chart(st, width=44, rows_n=10):
+    """Кривая P/L: allow (зелёная) и block (красная) — в правой пустой зоне."""
+    if len(st.pnl_hist) < 2 and not (st.laya_stats["allow_n"] or st.laya_stats["block_n"]):
+        return Text("P/L появится после закрытия\nпервых Laya-сделок…", style=DIM)
+    hist = list(st.pnl_hist)
+    if len(hist) < 2:
+        # ещё мало точек — покажем цифры крупно
+        s = st.laya_stats
+        t = Text()
+        t.append(f"  ALLOW {s['allow_pnl']:+.2f}₽  ({s['allow_n']})\n",
+                 style="bold " + (UP if s['allow_pnl'] >= 0 else DOWN))
+        t.append(f"  BLOCK {s['block_pnl']:+.2f}₽  ({s['block_n']})",
+                 style="bold " + (DOWN if s['block_pnl'] < 0 else UP))
+        return t
+    # два ряда значений, общий масштаб
+    a_vals = [a for _, a, _ in hist][-width:]
+    b_vals = [b for _, _, b in hist][-width:]
+    allv = a_vals + b_vals
+    hi, lo = max(allv), min(allv)
+    rng = (hi - lo) or 1
+    # сетка rows_n x width: рисуем обе линии точками (b поверх a)
+    grid: list = [[" "] * len(a_vals) for _ in range(rows_n)]
+    colors: list = [[None] * len(a_vals) for _ in range(rows_n)]
+    y = lambda v: min(rows_n - 1, int((hi - v) / rng * (rows_n - 1)))
+    for x, v in enumerate(a_vals):
+        grid[y(v)][x] = "●"; colors[y(v)][x] = UP
+    for x, v in enumerate(b_vals):
+        grid[y(v)][x] = "○"; colors[y(v)][x] = DOWN
+    t = Text()
+    for r in range(rows_n):
+        for c in range(len(a_vals)):
+            t.append(grid[r][c], style=colors[r][c] or "#1b242e")
+        t.append("\n")
+    t.append(f"hi {hi:+.2f}  lo {lo:+.2f}  ", style=DIM)
+    t.append("●ALLOW ", UP); t.append("○BLOCK", DOWN)
+    return t
+
+
+def render_stats(st):
+    """Богатая статистика: потоки, скорость, стены, сигналы, рекорды дня."""
+    tape = list(st.tape_view)
+    n = len(tape)
+    buys = sum(1 for *_, d in tape if d > 0)
+    vol_buy = sum(s for _, _, s, d in tape if d > 0)
+    vol_sell = sum(s for _, _, s, d in tape if d < 0)
+    # скорость: принтов за последнюю минуту
+    now = datetime.now()
+    per_min = sum(1 for ts, *_ in tape if (now - ts).total_seconds() <= 60)
+    max_buy = max((s for _, _, s, d in tape if d > 0), default=0)
+    max_sell = max((s for _, _, s, d in tape if d < 0), default=0)
+    ice_n = sum(1 for s in st.walls.values() for w in s.values() if w["iceberg"])
+    t = Text()
+    t.append(f"сделок {n} ({per_min}/мин)\n", TXT)
+    t.append(Text.assemble(("▲", UP), (f"{buys} ", TXT), ("▼", DOWN),
+                           (f"{n - buys}  ", TXT),
+                           (f"V {vol_buy + vol_sell:.0f}\n", DIM)))
+    t.append(Text.assemble((f"Vbuy {vol_buy:.0f} ", UP), (f"Vsell {vol_sell:.0f}\n", DOWN)))
+    t.append(Text.assemble(("max⚡ ", "#ffd166"), (f"buy {max_buy:.0f} ", UP),
+                           (f"sell {max_sell:.0f}\n", DOWN)))
+    t.append(Text.assemble((f"стен bid {len(st.walls['bid'])} / ask {len(st.walls['ask'])}  ",
+                            WALL), (f"айсбергов {ice_n}\n", ICE)))
+    t.append(Text.assemble(("порог⚡ ", DIM), (f"≥{st.big_threshold:.0f} ", "#ffd166"),
+                           (f"(TUI_BIG_MIN)\n", DIM)))
+    # последние сигналы стен
+    sigs = list(st.signals)[:3]
+    for ts, msg, col, _w in sigs:
+        t.append(Text.assemble((ts.strftime("%H:%M:%S ") , DIM), (msg + "\n", col)))
+    return t
+
+
+def build_ui(st, W=150, H=42, tape_big_only=False):
     layout = Layout()
     layout.split_column(Layout(name="top", size=3), Layout(name="body"))
     layout["body"].split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=3))
     layout["left"].split_column(Layout(name="book", ratio=3), Layout(name="big", size=9),
                                 Layout(name="laya", size=9))
-    layout["right"].split_column(Layout(name="cand"), Layout(name="mid", ratio=1),
-                                 Layout(name="bottom", ratio=1))
-    layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=30))
+    layout["right"].split_column(
+        Layout(name="toprow", ratio=1), Layout(name="mid", ratio=1),
+        Layout(name="bottom", ratio=1))
+    layout["toprow"].split_row(Layout(name="cand"), Layout(name="pnl", ratio=1))
+    layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=34))
 
     with st.lock:
         last = st.tape[-1] if st.tape else None
@@ -432,11 +525,13 @@ def build_ui(st, W=150, H=42):
             b3 = sum(s for _, s in bids[:3]); a3 = sum(s for _, s in asks[:3])
             imb = (b3 - a3) / (b3 + a3) if b3 + a3 else 0
         imb_col = UP if imb > 0.15 else (DOWN if imb < -0.15 else DIM)
+        spr = (asks[0][0] - bids[0][0]) if bids and asks else 0.0
         top = Text.assemble(
             (f" {st.symbol}  ", "bold"),
             (f"{last[1]:.2f}" if last else "—", "bold " + (UP if last and last[3] > 0 else DOWN)),
             (f"   imb(3) {imb:+.2f} ", imb_col),
             (f"   CVD {st.cvd:+.0f} ", "bold " + (UP if st.cvd >= 0 else DOWN)),
+            (f"   спред {spr:.2f} " if bids and asks else "", DIM),
             (" ", ""),
         )
         # спарклайн CVD отдельной строкой нельзя — рисуем рядом
@@ -451,7 +546,9 @@ def build_ui(st, W=150, H=42):
         layout["mid"].update(Panel(render_clusters(st, window_hours=None),
                                    title="[dim]кластеры объёма (день) · █buy ▓sell · ◄POC[/dim]",
                                    border_style="#2a3542"))
-        layout["tape"].update(Panel(render_tape(st), title="[dim]лента[/dim]",
+        layout["tape"].update(Panel(render_tape(st, big_only=tape_big_only),
+                                    title=("[dim]лента · КРУПНЫЕ[/dim]" if tape_big_only
+                                           else "[dim]лента[/dim]"),
                                     border_style="#2a3542"))
 
         # крупные принты
@@ -494,25 +591,15 @@ def build_ui(st, W=150, H=42):
                 (" (allow-block)", DIM)))
         layout["laya"].update(Panel(lt, title="[dim]Laya-гейт · P/L allow vs block[/dim]",
                                     border_style="#2a3542"))
+        # правая верхняя пустая зона: кривая P/L
+        layout["pnl"].update(Panel(render_pnl_chart(st),
+                                   title="[dim]кривая P/L · ●allow ○block[/dim]",
+                                   border_style="#2a3542"))
 
-        # статистика: cvd-спарклайн, дисбаланс по 10с-корзинам, сигналы счётом
-        n = len(st.tape_view)
-        buys = sum(1 for *_, d in st.tape_view if d > 0)
-        stat = Text.assemble(
-            (f"сделок {n}\n", TXT), (f"▲{buys} ▼{n - buys}\n", DIM),
-            (f"стен bid {len(st.walls['bid'])} / ask {len(st.walls['ask'])}\n", WALL),
-            (f"айсбергов {sum(1 for s in st.walls.values() for w in s.values() if w['iceberg'])}\n", ICE))
-        sigs = list(st.signals)[:6]
-        sig_tb = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
-        sig_tb.add_column(width=8); sig_tb.add_column(width=24)
-        for ts, msg, col, w in sigs:
-            sig_tb.add_row(Text(ts.strftime("%H:%M:%S"), style=DIM),
-                           Text(msg, style=col))
-        stat.append("\n")
-        layout["stats"].update(Panel(Text.assemble(stat),
+        # богатая статистика
+        layout["stats"].update(Panel(render_stats(st),
                                      title="[dim]статистика[/dim]",
                                      border_style="#2a3542"))
-        # сигналы кладём в ту же колонку: переразметим bottom
     return layout
 
 
@@ -561,6 +648,8 @@ def main():
     ap.add_argument("--speed", type=float, default=30)
     ap.add_argument("--candle-sec", type=int, default=30)
     ap.add_argument("--refresh", type=float, default=0.4)
+    ap.add_argument("--tape-big", action="store_true",
+                    help="лента показывает только принты >= TUI_BIG_MIN")
     a = ap.parse_args()
     st = MarketState(a.symbol, a.candle_sec)
     if a.replay:
@@ -571,10 +660,10 @@ def main():
             sys.exit("FINAM_TOKEN не задан (или --replay файл)")
         live_mode(st, a.symbol, token)
     try:
-        with Live(build_ui(st), refresh_per_second=2.5, screen=True) as live:
+        with Live(build_ui(st, tape_big_only=a.tape_big), refresh_per_second=2.5, screen=True) as live:
             while True:
                 time.sleep(a.refresh)
-                live.update(build_ui(st))
+                live.update(build_ui(st, tape_big_only=a.tape_big))
     except KeyboardInterrupt:
         pass
 
