@@ -377,7 +377,9 @@ def render_candles(st, width=46, rows_n=13):
 
 
 def render_clusters(st, rows_n=15, width=50, window_hours=None):
-    """Кластеры объёма: бары по ценовым уровням из ленты. window_hours=None = весь день."""
+    """Кластеры объёма: бары по ценовым уровням из ленты.
+    window_hours=None = весь день; иначе окно в часах.
+    Диапазон цен — весь (min..max ленты), уровни агрегируются в rows_n корзин."""
     if len(st.tape) < 10:
         return Text("ожидание данных…", style=DIM)
     tape = list(st.tape)
@@ -385,24 +387,24 @@ def render_clusters(st, rows_n=15, width=50, window_hours=None):
         t_last = tape[-1][0]
         cut = t_last.timestamp() - window_hours * 3600
         tape = [r for r in tape if r[0].timestamp() >= cut] or tape[-500:]
-    # группировка по тикам
-    clusters = {}   # price -> [buy, sell]
-    for _, p, s, d in tape:
-        key = round(p / st.tick) * st.tick
-        c = clusters.setdefault(key, [0.0, 0.0])
-        c[0 if d > 0 else 1] += s
-    if not clusters:
+    if not tape:
         return Text("…", style=DIM)
-    mx = max(b + sl for b, sl in clusters.values())
+    lo, hi = min(p for _, p, _, _ in tape), max(p for _, p, _, _ in tape)
+    lo = round(round(lo / st.tick) * st.tick, 4)
+    hi = round(round(hi / st.tick) * st.tick, 4)
+    n_bins = max(1, int(round((hi - lo) / st.tick)) + 1)
+    # агрегация в корзины по rows_n
+    bin_sz = max(st.tick, (hi - lo) / (rows_n - 1) if rows_n > 1 else st.tick)
+    clusters = {}   # bin_price -> [buy, sell]
+    for _, p, s, d in tape:
+        k = round(lo + round((p - lo) / bin_sz) * bin_sz, 4)
+        c = clusters.setdefault(k, [0.0, 0.0])
+        c[0 if d > 0 else 1] += s
+    mx = max(b + sl for b, sl in clusters.values()) or 1.0
     poc = max(clusters, key=lambda k: sum(clusters[k]))
-    lo, hi = min(clusters), max(clusters)
-    # один ряд на тик (если уровней много — шагаем)
-    step = max(1, int((hi - lo) / st.tick / rows_n) + 1)
-    prices = sorted(clusters, reverse=True)
-    shown = prices[::step][:rows_n]
     mx_w = width - 14
     t = Text()
-    for p in shown:
+    for p in sorted(clusters, reverse=True):
         b, sl = clusters[p]
         tot = b + sl
         nb = int(b / mx * mx_w)
@@ -410,7 +412,6 @@ def render_clusters(st, rows_n=15, width=50, window_hours=None):
         is_poc = p == poc
         col_b = WALL if is_poc else UP
         col_s = WALL if is_poc else DOWN
-        pct = tot / mx
         t.append(Text(f"{p:8.2f} ", style=WALL if is_poc else DIM))
         t.append(Text("█" * nb, style=col_b))
         t.append(Text("▓" * ns, style=col_s))
@@ -509,12 +510,15 @@ def build_ui(st, W=150, H=42, tape_big_only=False):
     layout = Layout()
     layout.split_column(Layout(name="top", size=3), Layout(name="body"))
     layout["body"].split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=3))
-    layout["left"].split_column(Layout(name="book", ratio=3), Layout(name="big", size=9),
+    layout["left"].split_column(Layout(name="book", ratio=3),
+                                Layout(name="midrow_l", size=9),
                                 Layout(name="laya", size=9))
+    layout["midrow_l"].split_row(Layout(name="big"), Layout(name="signals", ratio=1))
     layout["right"].split_column(
-        Layout(name="toprow", ratio=1), Layout(name="mid", ratio=1),
+        Layout(name="toprow", ratio=1), Layout(name="midrow", ratio=1),
         Layout(name="bottom", ratio=1))
     layout["toprow"].split_row(Layout(name="cand"), Layout(name="pnl", ratio=1))
+    layout["midrow"].split_row(Layout(name="mid"), Layout(name="mid2", ratio=1))
     layout["bottom"].split_row(Layout(name="tape"), Layout(name="stats", size=34))
 
     with st.lock:
@@ -544,14 +548,17 @@ def build_ui(st, W=150, H=42, tape_big_only=False):
                                     title=f"[dim]свечи {st.candle_sec}с · стены/айсберги[/dim]",
                                     border_style="#2a3542"))
         layout["mid"].update(Panel(render_clusters(st, window_hours=None),
-                                   title="[dim]кластеры объёма (день) · █buy ▓sell · ◄POC[/dim]",
+                                   title="[dim]кластеры (день) · █buy ▓sell · ◄POC[/dim]",
                                    border_style="#2a3542"))
+        layout["mid2"].update(Panel(render_clusters(st, window_hours=1),
+                                    title="[dim]кластеры (1ч)[/dim]",
+                                    border_style="#2a3542"))
         layout["tape"].update(Panel(render_tape(st, big_only=tape_big_only),
                                     title=("[dim]лента · КРУПНЫЕ[/dim]" if tape_big_only
                                            else "[dim]лента[/dim]"),
                                     border_style="#2a3542"))
 
-        # крупные принты
+        # крупные принты (слева) + последние сигналы стен (справа от них)
         bt = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
         bt.add_column(width=8); bt.add_column(width=7); bt.add_column(width=8)
         for ts, p, s, d in list(st.big_prints)[-4:][::-1]:
@@ -562,6 +569,15 @@ def build_ui(st, W=150, H=42, tape_big_only=False):
         layout["big"].update(Panel(bt or Text("—", style=DIM),
                                    title=f"[dim]крупные ≥{st.big_threshold:.0f}[/dim]",
                                    border_style="#2a3542"))
+        sg = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
+        sg.add_column(width=8); sg.add_column(width=22)
+        for ts, msg, col, _w in list(st.signals)[:4]:
+            sg.add_row(Text(ts.strftime("%H:%M:%S"), style=DIM),
+                       Text(msg, style=col))
+        if not st.signals:
+            sg.add_row(Text("—", style=DIM), Text("ждём касаний…", style=DIM))
+        layout["signals"].update(Panel(sg, title="[dim]сигналы стен[/dim]",
+                                       border_style="#2a3542"))
 
         # Laya-вердикты + P/L A/B
         lt = Table(box=box.SIMPLE, show_header=False, padding=(0, 0))
