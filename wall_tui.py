@@ -91,22 +91,45 @@ class MarketState:
                 import urllib.request
                 body = json.dumps({
                     "state": {"document": json.dumps(state)},
-                    "questions": {"trade": {
-                        "type": "rating",
-                        "instructions": f"Should we {action} at wall {price}?"}}}).encode()
+                    "questions": {
+                        "verdict": {
+                            "type": "choice",
+                            "instructions": f"Order-flow wall trade gate: should we {action} at wall {price:.2f}? CVD={self.cvd:.0f}, wall_hits={state['wall_hits']}.",
+                            "criteria": {
+                                "allow": "wall supports the direction, proceed",
+                                "block": "adverse-move probability too high, reject",
+                                "escalate": "conflicting signals, skip and observe",
+                            },
+                        },
+                    }}).encode()
                 req = urllib.request.Request(
                     self.laya_url.rstrip("/") + "/v1/systemone", data=body,
                     headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with urllib.request.urlopen(req, timeout=8) as r:
                     res = json.loads(r.read())
-                # Jev-совместимый ответ: rating/trade -> value
-                v = res.get("trade", res)
-                val = float(v.get("value", 0.5))
-                verdict = "ALLOW" if val >= 0.5 else "BLOCK"
-                allowed = val >= 0.5
+                # Jev-совместимый ответ: answers.verdict = {choice, probabilities}
+                v = res.get("answers", {}).get("verdict", res.get("verdict", res))
+                if isinstance(v, dict):
+                    raw = str(v.get("choice", v.get("value", ""))).lower()
+                    probs = v.get("probabilities", {})
+                else:
+                    raw, probs = str(v).lower(), {}
+                if "allow" in raw:
+                    verdict, allowed, col = "ALLOW", True, "bold " + UP
+                elif "escalate" in raw:
+                    verdict, allowed, col = "ESCALATE", True, "bold #ffd166"
+                else:
+                    verdict, allowed, col = "BLOCK", False, "bold " + DOWN
+                # вероятности: если есть — берём P(allow)/P(block), иначе 1/0
+                if probs:
+                    pa = float(probs.get("allow", 0))
+                    pb = float(probs.get("block", 0))
+                    val = pa / (pa + pb) if pa + pb else 0.5
+                else:
+                    val = 1.0 if allowed else 0.0
                 self.laya_verdicts.appendleft(
                     (datetime.now(), f"{verdict} {action} {price:.2f}",
-                     val, "bold " + (UP if allowed else DOWN)))
+                     val, col))
                 self.laya_pending.append((datetime.now(), action, price, allowed))
             except Exception:
                 self.laya_verdicts.appendleft(
