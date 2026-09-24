@@ -90,6 +90,21 @@ def main():
         for k in list(d):
             d[k] = d[k] / max(1, n_ob.get(k, 1))
 
+    # --- CVD и минутные volume bars ---
+    cvd_series = []       # [col, cvd]
+    vol_bars = []         # [col, buy, sell]
+    minutes = {}          # minute_index -> [buy, sell]
+    cvd = 0.0
+    trades.sort(key=lambda t: t[0])
+    for c, r, s, d in trades:
+        cvd += s * d
+        cvd_series.append([c, round(cvd)])
+        mi = int(col_times[c] // 60)
+        m = minutes.setdefault(mi, [0.0, 0.0])
+        m[0 if d > 0 else 1] += s
+    for mi, (b, sl) in sorted(minutes.items()):
+        vol_bars.append([mi, round(b), round(sl)])
+
     data = {
         "group": a.group,
         "colSec": a.col_sec,
@@ -99,6 +114,8 @@ def main():
         "bids": [[r, c, round(s)] for (r, c), s in bids.items()],
         "asks": [[r, c, round(s)] for (r, c), s in asks.items()],
         "trades": trades,
+        "cvd": cvd_series,
+        "volBars": vol_bars,
     }
     js = json.dumps(data, separators=(",", ":"))
     size_mb = len(js) / 1e6
@@ -143,28 +160,28 @@ for(const [, ,s] of D.asks) mxA=Math.max(mxA,s);
 const mx=Math.max(mxB,mxA);
 
 function draw(){
-  ctx.fillStyle='#0b0e14'; ctx.fillRect(0,0,W,H);
-  const x0=Math.max(0,Math.floor(view.x/cellW())), x1=Math.min(D.nCols,Math.ceil((view.x+W)/cellW()));
   const cellWv=cellW(), cellHv=view.cellH;
-  const y0=Math.max(0,Math.floor(view.y/cellHv)), y1=Math.min(D.nRows,Math.ceil((view.y+H)/cellHv));
+  const chartH=H-58;                       // снизу: volume bars 44 + время 14
+  ctx.fillStyle='#0b0e14'; ctx.fillRect(0,0,W,H);
+  const x0=Math.max(0,Math.floor(view.x/cellWv)), x1=Math.min(D.nCols,Math.ceil((view.x+W)/cellWv));
+  const y0=Math.max(0,Math.floor(view.y/cellHv)), y1=Math.min(D.nRows,Math.ceil((view.y+chartH)/cellHv));
   // ячейки глубины
   for(const [r,c,s] of D.bids){
     const x=c*cellWv-view.x, y=r*cellHv-view.y;
-    if(x<-cellWv||x>W||y<-cellHv||y>H) continue;
+    if(x<-cellWv||x>W||y<-cellHv||y>chartH) continue;
     ctx.fillStyle=heat(s,mx,1);
     ctx.fillRect(x,y,Math.max(1,cellWv-0.3),Math.max(1,cellHv-0.3));
   }
   for(const [r,c,s] of D.asks){
     const x=c*cellWv-view.x, y=r*cellHv-view.y;
-    if(x<-cellWv||x>W||y<-cellHv||y>H) continue;
+    if(x<-cellWv||x>W||y<-cellHv||y>chartH) continue;
     ctx.fillStyle=heat(s,mx,-1);
     ctx.fillRect(x,y,Math.max(1,cellWv-0.3),Math.max(1,cellHv-0.3));
   }
   // сделки
-  const rMin=Math.max(3, Math.log2(1+50));
   for(const [c,r,s,d] of D.trades){
     const x=(c+0.5)*cellWv-view.x, y=(r+0.5)*cellHv-view.y;
-    if(x<-10||x>W+10||y<-10||y>H+10) continue;
+    if(x<-10||x>W+10||y<-10||y>chartH+10) continue;
     const rad=Math.min(9, 2+Math.log2(1+s)/2);
     ctx.fillStyle=d>0?'rgba(60,220,130,.95)':'rgba(255,90,100,.95)';
     ctx.beginPath();ctx.arc(x,y,rad,0,7);ctx.fill();
@@ -184,8 +201,37 @@ function draw(){
     if(c%stepC) continue;
     const x=c*cellWv-view.x;
     const sec=c*D.colSec, hh=Math.floor(sec/3600)+10, mm=Math.floor(sec%3600/60);
-    ctx.fillStyle='#8b949e'; ctx.fillText(`${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`, x+3, H-8);
-    ctx.fillStyle='#21262d'; ctx.fillRect(x,0,0.5,H); 
+    ctx.fillText(`${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`, x+3, H-6);
+    ctx.fillStyle='#21262d'; ctx.fillRect(x,0,0.5,chartH); ctx.fillStyle='#8b949e';
+  }
+  // === VOLUME BARS (минутные buy/sell, полоса снизу) ===
+  const vbY=chartH+4, vbH=40;
+  let mxBar=0; for(const [,b,s] of D.volBars) mxBar=Math.max(mxBar,b+s);
+  const bw=Math.max(2, cellWv*(60/D.colSec)*0.7);
+  ctx.fillStyle='#8b949e'; ctx.fillText('vol/min', 8, vbY+10);
+  for(const [mi,b,s] of D.volBars){
+    const x=(mi*60/D.colSec)*cellWv-view.x;
+    if(x<-20||x>W+20) continue;
+    const hs=(s/mxBar)*vbH, hb=(b/mxBar)*vbH;
+    ctx.fillStyle='rgba(255,90,100,.75)'; ctx.fillRect(x,vbY+vbH-hs,bw,hs);
+    ctx.fillStyle='rgba(60,220,130,.75)'; ctx.fillRect(x,vbY+vbH-hs-hb,bw,hb);
+  }
+  // === CVD (полоса сверху) ===
+  if(D.cvd&&D.cvd.length>1){
+    const cY=4, cH=22;
+    let mn=Infinity,mx2=-Infinity;
+    for(const [,v] of D.cvd){if(v<mn)mn=v;if(v>mx2)mx2=v;}
+    const rng=(mx2-mn)||1;
+    ctx.strokeStyle='#d29922'; ctx.lineWidth=1.4; ctx.beginPath();
+    let st=false;
+    for(const [c,v] of D.cvd){
+      const x=(c+0.5)*cellWv-view.x;
+      if(x<-5||x>W+5){st=false;continue;}
+      const y=cY+cH-((v-mn)/rng)*cH;
+      if(!st){ctx.moveTo(x,y);st=true;}else ctx.lineTo(x,y);
+    }
+    ctx.stroke(); ctx.lineWidth=1;
+    ctx.fillStyle='#d29922'; ctx.fillText(`CVD ${mn.toFixed(0)} … ${mx2.toFixed(0)}`, 60, cY+10);
   }
 }
 function cellW(){return view.cellW;}
