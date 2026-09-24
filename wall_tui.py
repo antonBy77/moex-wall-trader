@@ -188,17 +188,40 @@ class MarketState:
 
     def on_book(self, ob):
         with self.lock:
-            self.book = {"bids": ob["bids"], "asks": ob["asks"]}
+            bids = ob.get("bid") or ob.get("bids") or []
+            asks = ob.get("ask") or ob.get("asks") or []
+            self.book = {"bids": bids, "asks": asks}
+            # порог стены: TUI_WALL_MODE
+            #   fixed — фиксированные TUI_WALL_K / TUI_WALL_MIN (как раньше)
+            #   auto  — квантиль распределения уровней стакана (TUI_WALL_Q, 0..1)
+            #   ratio — множитель к среднему уровню (TUI_WALL_K трактуется как ×среднее)
+            mode = os.environ.get("TUI_WALL_MODE", "fixed")
             K = float(os.environ.get("TUI_WALL_K", 2.0))
             MIN = float(os.environ.get("TUI_WALL_MIN", 1500))
-            for side, levels in (("bid", ob["bids"]), ("ask", ob["asks"])):
+            Q = float(os.environ.get("TUI_WALL_Q", 0.97))
+            for side, levels in (("bid", bids), ("ask", asks)):
                 tops = levels[:10]
                 if len(tops) < 3:
                     continue
+                sizes = [s for _, s in tops]
+                if mode == "auto":
+                    # квантиль по текущим уровням + абсолютный минимум MIN
+                    import statistics
+                    try:
+                        thr = max(statistics.quantiles(sizes, n=100)[int(Q * 100) - 1], MIN)
+                    except Exception:
+                        thr = MIN
+                    need = lambda s, avg: s >= thr
+                elif mode == "ratio":
+                    # множитель к СРЕДНЕМУ уровню (не к соседям) + минимум
+                    avg_all = sum(sizes) / len(sizes)
+                    need = lambda s, avg: s >= max(K * avg_all, MIN)
+                else:  # fixed
+                    need = lambda s, avg: s >= max(K * avg, MIN)
                 for p, s in tops:
                     others = [x[1] for x in tops if x[0] != p][:6]
                     avg = sum(others) / len(others) if others else 0
-                    if avg and s >= max(K * avg, MIN):
+                    if avg and need(s, avg):
                         w = self.walls[side].get(p)
                         if w:
                             if w["hits"] >= 1 and s >= w["size0"] * 0.9 \
